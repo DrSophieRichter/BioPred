@@ -1,0 +1,1496 @@
+---
+title: "BioPred"
+author: "Sophie"
+date: '2022-05-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(abind)
+library(pROC)
+library(DescTools)
+library(flextable)
+library(officer)
+source("BioPred_funs.R")
+library(caret)
+library(mice)
+library(stringr)
+library(table1)
+library(ResourceSelection)
+library(glmnet)
+library(gridExtra)
+library(grid)
+library(rms)
+library(CalibrationCurves)
+
+```
+
+
+
+
+
+# Stepwise inclusion of patients
+
+```{r}
+#Use latest GCS but do not impute unknown values
+gcs <- read.csv("../Data/CENTER_injury_data.csv", na.strings = c("", " ", "NA", "No Sum"))
+gcs$Latest_GCS <- ifelse(is.na(gcs$InjuryHx.GCSEDDischScore)==FALSE, gcs$InjuryHx.GCSEDDischScore, 
+                         ifelse(is.na(gcs$InjuryHx.GCSEDArrScore)==FALSE, gcs$InjuryHx.GCSEDArrScore,
+                                ifelse(is.na(gcs$InjuryHx.GCSFirstHospScore)==FALSE, gcs$InjuryHx.GCSFirstHospScore,
+                                       ifelse(is.na(gcs$InjuryHx.GCSPreHospBestScore)==FALSE, gcs$InjuryHx.GCSPreHospBestScore,
+                                       gcs$InjuryHx.GCSPreHospBestReportedTotalScore))))
+data <- 
+  gcs %>%
+  select(Master_subject_ID = subjectId,
+         Latest_GCS)
+```
+```{r}
+#Marshall score
+marshall <- read.csv("../Data/CENTER_imaging_data.csv", na.strings = c("", " ", "NA"))
+marshall <- 
+  marshall %>%
+  select(Master_subject_ID = subjectId,
+         Marshall_score_central = Imaging.MarshallCTClassification) %>%
+  filter(is.na(Marshall_score_central) == FALSE) %>%
+  group_by(Master_subject_ID) %>%
+  slice(1)
+data <- merge(data, marshall, by = "Master_subject_ID", all.x = TRUE, all.y = TRUE)
+
+#supplement missing Marshall scores from Virginias review
+clinical <- read.csv("C:/Users/sophie/Documents/Documents/Medicine/PhD/Legacy_data/Most_uptodate_curated_data/Sophies_clinical_database_20220822.csv", na.strings = c("", " ", "NA"))
+clinical <- 
+  clinical %>%
+  select(Master_subject_ID, 
+         Marshall_score_vfjn = Marshall_score) %>%
+  filter(is.na(Master_subject_ID)==FALSE)
+data <- merge(clinical, data, by = "Master_subject_ID", all.x = FALSE, all.y = TRUE)
+data$Marshall_score <- ifelse(is.na(data$Marshall_score_central)== FALSE, data$Marshall_score_central, data$Marshall_score_vfjn)
+data <- 
+  data %>%
+  select(-c(Marshall_score_central,
+            Marshall_score_vfjn))
+data$Marshall_score <- factor(data$Marshall_score)
+```
+
+```{r}
+#Add of time of injury to calculate how long after the 
+#serum biomarker was sampled
+time <- read.csv("../Data/CENTER_timeofinj_data.csv", na.strings = c("", " ", "NA"))
+
+time$Date_inj <- "1970-01-01"
+time$Date_Time_inj <- as.POSIXct(paste(time$Date_inj, time$Subject.TimeInj), format="%Y-%m-%d %H:%M:%S")
+time <- 
+  time %>% 
+  select(Master_subject_ID = subjectId,
+         Date_Time_inj)
+
+data <- merge(data, time, by = "Master_subject_ID", all.x = TRUE, all.y = TRUE)
+```
+
+```{r}
+#add serum biomarker data
+bio <- read.csv("../Data/CENTER_biomarker_data.csv", na.strings = c("", " ", "NA"))
+bio$Date_Time_bio <- as.POSIXct(paste(bio$Biomarkers.CollectionDate, bio$Biomarkers.CollectionTime), format="%d/%m/%Y %H:%M:%S")
+colnames(bio) <- gsub("Biomarkers.", "", colnames(bio), fixed = TRUE)
+bio <- 
+  bio %>%
+  select(Master_subject_ID = subjectId,
+         Date_Time_bio,
+         GFAP, 
+         NFL,
+         NSE,
+         S100B,
+         Tau,
+         UCH.L1) %>%
+  group_by(Master_subject_ID) %>% 
+  slice(which.min(Date_Time_bio))
+
+#Select only patients with biomarker samples within 24h of injury
+data <- merge(data, bio, by = "Master_subject_ID", all.x = TRUE, all.y = TRUE)
+data$Time_to_bio <- difftime(data$Date_Time_bio, data$Date_Time_inj, units = "hours")
+data$Time_to_bio <- abs(as.numeric(data$Time_to_bio))
+
+#Log transform biomarker concentrations
+data <-
+  data %>%
+  mutate(across(c("GFAP", "NFL", "NSE", "S100B", "Tau", "UCH.L1"), 
+         log, 
+         .names = "{.col}"))
+
+#rename biomarkers to indicate they have not yet been adjusted
+#for sampling time
+data <-
+  data %>%
+  rename(GFAP_unadj = GFAP,
+         NFL_unadj = NFL,
+         NSE_unadj = NSE,
+         S100B_unadj = S100B,
+         Tau_unadj = Tau,
+         UCH.L1_unadj = UCH.L1)
+```
+
+```{r}
+#add auxillary data
+aux <- read.csv("../Data/CENTER_aux_data.csv", na.strings = c("", " ", "NA", "88"))
+colnames(aux) <- gsub("InjuryHx.", "", colnames(aux))
+colnames(aux) <- gsub("Subject.", "", colnames(aux))
+aux$MajorEI <- ifelse(aux$PelvicGirdleAIS >= 3 |
+                          aux$UpperExtremitiesAIS >= 3 |
+                          aux$ThoracicSpineAIS >= 3 |
+                          aux$AbdomenPelvicContentsAIS >= 3 |
+                          aux$ExternaAIS >= 3 |
+                          aux$ThoraxChestAIS >= 3 |
+                          aux$LumbarSpineAIS >= 3 |
+                          aux$LowerExtremitiesAIS >= 3, "present", "absent")
+aux <- 
+  aux %>%
+  select(-c(contains("AIS")))
+aux <-
+  aux %>%
+  select(Master_subject_ID = subjectId, everything())
+aux <-
+  aux %>%
+  rename(GOSE_6months = GOSE6monthEndpointDerived)
+aux$GOSE_6months <- factor(aux$GOSE_6months, ordered = TRUE)
+aux$GOSE_6months <- gsub("2_or_3", "2 or 3", aux$GOSE_6months, fixed = TRUE)
+
+aux$Outcome_5plus <- ifelse(is.na(aux$GOSE_6months) == TRUE, NA,
+                      ifelse(aux$GOSE_6months %in% c("1", "2 or 3", "4"), "1", "0"))
+aux$Outcome_5plus <- as.numeric(aux$Outcome_5plus)
+
+
+aux$InjViolenceVictimAlcohol <- factor(aux$InjViolenceVictimAlcohol, ordered = TRUE,
+                                       levels = c(0, 2, 1),
+                                       labels = c("absent", "suspected", "present"))
+aux$Hospital.ICUAdmisStatusIntubated <- factor(aux$Hospital.ICUAdmisStatusIntubated,
+                                               levels = c(0, 1),
+                                               labels = c("self-ventilating", "intubated"))
+aux$PatientType <- factor(aux$PatientType,
+                          levels = c(1, 2, 3),
+                          labels = c("ED", "ward", "ICU"))
+
+aux <- 
+  aux %>%
+  rename(Alcohol_intoxication = InjViolenceVictimAlcohol,
+         ICU_admission_status = Hospital.ICUAdmisStatusIntubated)
+
+aux$Admission_status <- ifelse(aux$PatientType == "ward", "ward",
+                          ifelse(aux$PatientType == "ICU" & 
+                                   is.na(aux$ICU_admission_status) == FALSE & 
+                                   aux$ICU_admission_status == "self-ventilating", "ICU (self-ventilating)",
+                                 ifelse(aux$PatientType == "ICU" & 
+                                          is.na(aux$ICU_admission_status) == FALSE & 
+                                          aux$ICU_admission_status == "intubated", "ICU (intubated)",
+                                        ifelse(aux$PatientType == "ICU" & 
+                                                 is.na(aux$ICU_admission_status) == TRUE, "ICU (airway unknown)",
+                                               ifelse(aux$PatientType == "ED", "not admitted", NA)))))
+aux$Admission_status <- factor(aux$Admission_status,
+                               levels = c("not admitted",
+                                          "ward",
+                                          "ICU (self-ventilating)",
+                                          "ICU (intubated)",
+                                          "ICU (airway unknown)"))
+
+
+data <- 
+  merge(data, aux, by = "Master_subject_ID", all.x = TRUE, all.y = TRUE)
+
+#add pupil data
+pup <- read.csv("../Data/CENTER_ImpactNoLab_data.csv", na.strings = c("88", " ", "", "NA"))
+colnames(pup) <- c("Master_subject_ID", "Motor_score", "Reactive_pupils", "Hypoxia", "Hypotension")
+pup$Reactive_pupils <- factor(pup$Reactive_pupils,
+                                ordered = TRUE,
+                                levels = c(0, 1, 2),
+                              labels = c(2, 1, 0))
+
+#categorise hypoxia and hypotension the same way as IMPACT did
+pup$Hypoxia <- ifelse(is.na(pup$Hypoxia) == TRUE, NA,
+                      ifelse(pup$Hypoxia %in% c(1, 2), "present or suspected", "absent"))
+pup$Hypoxia <- as.factor(pup$Hypoxia)
+pup$Hypotension <- ifelse(is.na(pup$Hypotension) == TRUE, NA,
+                      ifelse(pup$Hypotension %in% c(1, 2), "present or suspected", "absent"))
+pup$Hypotension <- as.factor(pup$Hypotension)
+
+data <- merge(data, pup, by = "Master_subject_ID", all.x = TRUE, all.y = TRUE)
+```
+
+```{r}
+#get CT reports
+ct <- read.csv("../Data/CENTER_CT_reports.csv", na.strings = c("", " ", "uninterpretable"))
+##Crash model needs:
+#TAI
+#Cistern
+#SAH
+#MidS
+#haematoma
+##Impact needs
+#EDH
+
+ct$CT_TAI <- ifelse(is.na(ct$Imaging.TAI)==TRUE, NA,
+                 ifelse(ct$Imaging.TAI == "present", "present", "absent"))
+ct$CT_Cistern <- ifelse(is.na(ct$Imaging.CisternalCompression)==TRUE, NA,
+                 ifelse(ct$Imaging.CisternalCompression == "present", "present", "absent"))
+ct$CT_SAH <- ifelse(is.na(ct$Imaging.TraumaticSubarachnoidHemorrhage)==TRUE, NA,
+                 ifelse(ct$Imaging.TraumaticSubarachnoidHemorrhage == "present", "present", "absent"))
+ct$CT_Mids <- ifelse(is.na(ct$Imaging.MidlineShift)==TRUE, NA,
+                 ifelse(ct$Imaging.MidlineShift == "present", "present", "absent"))
+ct$CT_EDH <- ifelse(is.na(ct$Imaging.EpiduralHematoma)==TRUE, NA,
+                 ifelse(ct$Imaging.EpiduralHematoma == "present", "present", "absent"))
+ct$CT_SDH <- ifelse(is.na(ct$Imaging.SubduralCollectionMixedDensity) == TRUE &
+                   is.na(ct$Imaging.SubduralHematomaAcute)==TRUE &
+                   is.na(ct$Imaging.SubduralHematomaSubacuteChronic) == TRUE, NA,
+                 ifelse(ct$Imaging.SubduralCollectionMixedDensity == "present" |
+                          ct$Imaging.SubduralHematomaAcute == "present" |
+                          ct$Imaging.SubduralHematomaSubacuteChronic == "present", "present", "absent"))
+ct$CT_Haematoma <- ifelse(is.na(ct$CT_EDH) == TRUE &
+                         is.na(ct$CT_SDH) == TRUE, NA,
+                       ifelse(ct$CT_EDH == "present" | ct$CT_SDH == "present", "present", "absent"))
+cols <- ct  %>% select(contains("CT_")) %>% colnames()
+ct[cols] <- lapply(ct[cols], factor) 
+ct <- 
+  ct %>%
+  filter(Imaging.Timepoint == "CT Early") %>%
+  select(Master_subject_ID = subjectId,
+         contains("CT_")) %>%
+  group_by(Master_subject_ID) %>%
+  slice(1)
+data <- 
+  merge(data, ct, by = "Master_subject_ID", all.x = TRUE, all.y = FALSE)
+```
+
+```{r}
+#Format age for Crash model
+data$Age_crash <- ifelse(is.na(data$Age) == TRUE, NA,
+                         ifelse(data$Age < 40, 40, data$Age))
+data$Age_crash <- data$Age_crash - 40
+
+#IMPACT lab variables
+lab <- read.csv("../Data/CENTER_ImpactLab.csv", na.strings = c("NA", "", " "))
+lab$Date_time <- as.POSIXct(paste(lab$Labs.DLDate, lab$Labs.DLTime), format="%Y-%m-%d %H:%M:%S")
+lab <-
+  lab %>%
+  filter(is.na(Labs.DLGlucosemmolL)==FALSE | is.na(Labs.DLHemoglobingdL) == FALSE) %>%
+  group_by(subjectId) %>%
+  slice(which.min(Date_time)) %>%
+  select(Master_subject_ID = subjectId,
+         Glucose = Labs.DLGlucosemmolL,
+         Hb = Labs.DLHemoglobingdL)
+data <- 
+  merge(data, lab, by = "Master_subject_ID", all.x = TRUE, all.y = FALSE)
+```
+```{r}
+#Record whether patient has an MRI equivalent to Marshall 1 to help impute missing Marshall scores
+#Add TAI grade where available
+#and record if TAi cannot be reported
+adam1 <- read.csv("../Data/Grade_these_scans_filled_vfjn.csv", na.strings = c("", "NA", " "))
+adam1 <-
+  adam1 %>%
+  select(SiteCode = Site, 
+         Master_subject_ID, 
+         Scan_ID_MR1 = Scan_ID, 
+         Comment:BS_pons_right)
+adam2 <- read.csv("../Data/More_scans_to_grade_filled.csv", na.strings = c("", "NA", " "))
+adam2 <-
+  adam2 %>%
+  select(SiteCode,
+         Master_subject_ID,
+         Scan_ID_MR1,
+         Comment:BS_pons_right)
+adam <-
+  bind_rows(adam1, adam2)
+
+temp <- 
+  adam %>%
+  filter(Any_TAI %in% c("yes", "no"))
+data$MRI_used <- ifelse(data$Master_subject_ID %in% temp$Master_subject_ID, "yes","no")
+data$Marshall_score <- ifelse(is.na(data$Marshall_score) == FALSE, data$Marshall_score,
+                              ifelse(data$MRI_used == "yes", "1", data$Marshall_score))
+
+#Format Marshall score as per IMPACT
+data$Marshall_score <- ifelse(data$Marshall_score %in% c("5", "6"), "5 or 6", as.character(data$Marshall_score))
+data$Marshall_score <- factor(data$Marshall_score,
+                                 levels = c("1", "2", "3", "4", "5 or 6"))
+
+#Indicate missing GCS in the context of intubation
+data$Latest_GCS <- ifelse(is.na(data$Latest_GCS)==TRUE & data$ICU_admission_status == "intubated", "T", as.character(data$Latest_GCS))
+data$Latest_GCS <-
+  factor(data$Latest_GCS,
+         levels = c("15", "14", "13",  "12", "11", "10", "9", "8", "7", "6", "5", "4", "3", "T"))
+
+
+
+#############################Data cleaning complete####################################################################
+```
+
+
+```{r}
+################################################
+#
+# Get numbers for Flowchart of
+# patient inclusion
+#
+################################################
+
+#save full CENTER-TBI dataframe
+center <- data
+
+#start weeding out patients
+print(paste0("Number of patients in CENTER-TBI: ", n_distinct(data$Master_subject_ID)))
+
+num <- 
+  data %>%
+  filter(Age <16) %>%
+  nrow()
+print(paste0("Of those, patients who were aged less than 16: ", num))
+data <-
+  data %>%
+  filter(Age >= 16)
+print(paste0("Number of CENTER-TBI patients aged >=16: ", n_distinct(data$Master_subject_ID)))
+
+num <- 
+  data %>%
+  filter(Time_to_bio > 24) %>%
+  nrow()
+print(paste0("Of those, patients who did not have serum biomarker samples within 24h: ", num))
+data <- 
+  data %>%
+  filter(Time_to_bio <= 24)
+print(paste0("Number of adults with serum biomarkers within 24h: ", n_distinct(data$Master_subject_ID)))
+
+#Select only patients with moderate-severe TBI
+summary(as.factor(data$Latest_GCS))
+mild <- 
+  data %>%
+  filter(Latest_GCS %in% c("15", "14", "13"))
+print(paste0("Patients with mild TBI: ", nrow(mild)))
+na <-
+  data %>%
+  filter(is.na(Latest_GCS) == TRUE | Latest_GCS == "T")
+print(paste0("Patients without GCS: ", nrow(na)))
+
+data <-
+  data %>%
+  filter(!(Master_subject_ID %in% mild$Master_subject_ID | Master_subject_ID %in% na$Master_subject_ID))
+print(paste0("Patients with mod-sev TBI: ", nrow(data)))
+
+data <-
+  data %>%
+  filter(is.na(data$Marshall_score)==FALSE)
+print(paste0("Patients with mod-sev TBI and CT: ", nrow(data)))
+
+```
+
+
+```{r}
+#divide into Groups based on Marshall score
+data$Group2 <- ifelse(data$Marshall_score %in% c("1", "2"), "Marshall 1 & 2", "Marshall >2")
+data$Group2 <- factor(data$Group2)
+data %>%
+  group_by(Group2) %>%
+  summarise(n())
+
+data$Group1 <- ifelse(data$Marshall_score %in% c("1"), "Marshall 1", "Marshall >1")
+data$Group1 <- factor(data$Group1)
+data %>%
+  group_by(Group1) %>%
+  summarise(n())
+
+data$Group3 <- ifelse(data$Marshall_score %in% c("1", "2"), "Marshall 1 & 2", 
+                      ifelse(data$Marshall_score %in% c("3", "4"), "Marshall 3 & 4", "Marshall 5 & 6"))
+dataGroup3  <- factor(data$Group3)
+data %>%
+  group_by(Group3) %>%
+  summarise(n())
+```
+
+
+
+
+
+```{r}
+
+data$Motor_score <- factor(data$Motor_score,
+                          levels = c("6", "5", "4", "3", "2", "1"))
+
+data$Motor_score <- droplevels(data$Motor_score)
+data$Latest_GCS <- droplevels(data$Latest_GCS)
+
+#Summary Table by Group
+label(data$MajorEI) <-  "Major extra-cranial injury" 
+label(data$Admission_status) <-  "Care path" 
+label(data$Marshall_score) <-  "Marshall CT score"
+label(data$Time_to_bio) <-  "Time to blood protein sample"
+units(data$Time_to_bio) <- "hours"
+label(data$Reactive_pupils) <-  "Reactive pupils"
+label(data$Alcohol_intoxication) <-  "Alcohol intoxication"
+label(data$Outcome_5plus) <-  "Outcome"
+label(data$Latest_GCS) <- "Glasgow Coma Scale"
+label(data$Motor_score) <- "Motor score"
+units(data$Glucose) <- "mmol/L"
+label(data$Hb) <- "Haemoglobin"
+units(data$Hb) <- "g/dL"
+label(data$CT_TAI) <- "Petechial haemorrhage"
+label(data$CT_Cistern) <- "Cisternal compression"
+label(data$CT_Mids) <- "Midline shift"
+label(data$CT_EDH) <- "EDH"
+label(data$CT_SAH) <- "SAH"
+label(data$CT_Haematoma) <- "Haematoma"
+label(data$GOSE_6months) <- "GOSE at 6 months"
+
+table1 <- table1(~ Age + 
+                   Sex + 
+                   Admission_status + 
+                   MajorEI +
+                   Latest_GCS +
+                   Motor_score +
+                   Reactive_pupils +
+                   Hypoxia +
+                   Hypotension +
+                   Alcohol_intoxication +
+                   Time_to_bio +
+                   Glucose +
+                   Hb +
+                   Marshall_score +
+                   CT_TAI +
+                   CT_Cistern +
+                   CT_Mids +
+                   CT_SAH +
+                   CT_EDH +
+                   GOSE_6months | Group2,
+         data = data, 
+         droplevels=F,
+         render.continuous = my.render.cont, 
+         render.categorical = my.render.cat)
+
+ft1 <- t1flex(table1)
+save_as_docx(ft1, path = "Figures/Table1_main.docx")
+
+#repeat table one for sensitivity analysis
+#Marshall 1 vs Mrshall >1
+table1 <- table1(~ Age + 
+                   Sex + 
+                   Admission_status + 
+                   MajorEI +
+                   Latest_GCS +
+                   Motor_score +
+                   Reactive_pupils +
+                   Hypoxia +
+                   Hypotension +
+                   Alcohol_intoxication +
+                   Time_to_bio +
+                   Glucose +
+                   Hb +
+                   Marshall_score +
+                   CT_TAI +
+                   CT_Cistern +
+                   CT_Mids +
+                   CT_SAH +
+                   CT_EDH +
+                   GOSE_6months | Group1,
+         data = data, 
+         droplevels=F,
+         render.continuous = my.render.cont, 
+         render.categorical = my.render.cat)
+
+ft1 <- t1flex(table1)
+save_as_docx(ft1, path = "Figures/Table1_m1.docx")
+
+#repeat for sensitivity analysis
+#Marshall 1/2 vs 3/4 vs 5/6
+table1 <- table1(~ Age + 
+                   Sex + 
+                   Admission_status + 
+                   MajorEI +
+                   Latest_GCS +
+                   Motor_score +
+                   Reactive_pupils +
+                   Hypoxia +
+                   Hypotension +
+                   Alcohol_intoxication +
+                   Time_to_bio +
+                   Glucose +
+                   Hb +
+                   Marshall_score +
+                   CT_TAI +
+                   CT_Cistern +
+                   CT_Mids +
+                   CT_SAH +
+                   CT_EDH +
+                   GOSE_6months | Group3,
+         data = data, 
+         droplevels=F,
+         render.continuous = my.render.cont, 
+         render.categorical = my.render.cat)
+
+ft1 <- t1flex(table1)
+save_as_docx(ft1, path = "Figures/Table1_trio.docx")
+```
+
+
+
+```{r}
+#####Prepare data for modelling
+
+###Reference population (all adults with TBI and biomarkers)
+#set GCS in untestable Subgroup to GCS 3 and convert to numeric as used by CRASH
+#data$Latest_GCS <-  ifelse(data$Latest_GCS == "T", "3", as.character(data$Latest_GCS))
+data$Latest_GCS <- as.numeric(data$Latest_GCS)
+
+#define motor score as per IMPACT
+data$Motor_score <-  ifelse(data$Motor_score %in% c("5", "6"), "5_or_6", as.character(data$Motor_score))
+data$Motor_score <- factor(data$Motor_score,
+                          levels = c("1", "2", "3", "4", "5_or_6"))
+
+#Make sure Pupil, Hypoxia and hypotension are not ordered, else a polynomial fit will be applied
+data$Reactive_pupils <- factor(data$Reactive_pupils, 
+                                      ordered = FALSE,
+                                      levels = c("0", "1", "2"),
+                                      labels = c("0", "1", "2"))
+
+```
+
+
+```{r}
+#decide parameters (that will also influence computation time)
+set.seed(1)
+m     <- 10 #number of imputed datasets (aim 10-20)
+maxit <- 30 #number of iteration during imputation (aim 30-35)
+B     <- 1000 #total number of bootstrap samples (aim 1000-2000)
+
+```
+
+
+```{r}
+#############################################
+#
+# MULTIPLE IMPUTATION 
+#
+#############################################
+
+mydata <-
+  data %>%
+  select(Outcome_5plus,
+           GFAP_unadj,
+           NFL_unadj,
+           NSE_unadj,
+           S100B_unadj,
+           Tau_unadj,
+           UCH.L1_unadj,
+           Time_to_bio,
+           Age,
+           Age_crash,
+           Sex,
+           Latest_GCS, 
+           Motor_score,
+           Reactive_pupils,
+           Marshall_score,
+           CT_SAH,
+           CT_EDH,
+           CT_TAI,
+           CT_Cistern,
+           CT_Mids,
+           CT_Haematoma,
+           MajorEI,
+           Hypoxia,
+           Hypotension,
+           Admission_status,
+           Alcohol_intoxication,
+         Group2, Group1, Group3)
+
+#use imputation matrix to make create m imputed datasets
+imp_all <- mice(mydata, 
+                   print=T, 
+                   m = m, 
+                   maxit = maxit,
+                seed = 123)
+
+#check convergence
+plot(imp_all)
+
+#save complete datasets in a list
+imp_list_all <- vector(mode = "list", length = m)
+for (i in 1:m){
+  imp_list_all[[i]] <- complete(imp_all, i)
+}
+
+```
+
+```{r}
+
+#Adjust biomarker concentrations for time of sampling
+# within each imputed dataset
+
+proteins <- c("GFAP_unadj", "NFL_unadj", "NSE_unadj", "S100B_unadj", "Tau_unadj", "UCH.L1_unadj")
+for (p in 1:length(proteins)) {
+  imp_list_all <- 
+    adjust_bio(imp      = imp_all, 
+                imp_list = imp_list_all, 
+                mybio    = proteins[p])
+}
+  
+
+```
+
+```{r}
+#Divide dataset into cohorts
+
+#Marshall 1 & 2 cohort
+imp_list_m12 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group2 == "Marshall 1 & 2"))
+  
+#Marshall >2 cohort
+imp_list_m3456 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group2 == "Marshall >2"))
+
+#Marshall 1 cohort (CT-occult)
+imp_list_m1 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group1 == "Marshall 1"))
+
+##Marshall 2 cohort
+imp_list_m2 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Marshall_score == "2"))
+
+
+#Marshall >1 cohort (CT-overt)
+imp_list_m23456 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group1 != "Marshall 1"))
+
+#Marshall 3 & 4 cohort 
+imp_list_m34 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group3 == "Marshall 3 & 4"))
+
+#Marshall 5 & 6 cohort
+imp_list_m56 <- 
+  lapply(imp_list_all, 
+         function(x) filter(x, Group3 == "Marshall 5 & 6"))
+
+#Add Group indicator
+for (i in 1:m){
+  
+  imp_list_m12 <- 
+    lapply(imp_list_m12, 
+           function(x) {x$Label <- "m12"; return(x)})
+  
+  imp_list_m3456 <- 
+    lapply(imp_list_m3456, 
+           function(x) {x$Label <- "m3456"; return(x)})
+  
+  imp_list_m1 <- 
+    lapply(imp_list_m1, 
+           function(x) {x$Label <- "m1"; return(x)})
+  
+  imp_list_m2 <- 
+    lapply(imp_list_m2, 
+           function(x) {x$Label <- "m2"; return(x)})
+  
+  imp_list_m34 <- 
+    lapply(imp_list_m34, 
+           function(x) {x$Label <- "m34"; return(x)})
+  
+  imp_list_m56 <- 
+    lapply(imp_list_m56, 
+           function(x) {x$Label <- "m56"; return(x)})
+  
+  imp_list_m23456 <- 
+    lapply(imp_list_m23456, 
+           function(x) {x$Label <- "m23456"; return(x)})
+  
+}
+
+
+```
+
+
+
+```{r}
+#########################################
+#
+# Lasso regression to select the optimal
+# panel of biomarkers
+#
+#########################################
+
+panel_all <- select_panel(imputed_list = imp_list_all)
+panel_m12 <- select_panel(imputed_list = imp_list_m12)
+panel_m3456 <- select_panel(imputed_list = imp_list_m3456)
+
+temp <- cbind(panel_all,
+              panel_m12, 
+              panel_m3456)
+
+format_and_save_panel_table(temp = temp)
+```
+
+
+```{r}
+#Prepare model names
+mymodels <- c("plain_refit_crash_5", 
+              "plain_refit_impact_5",
+              
+              "withbio_refit_crash_5", 
+              "withbio_refit_impact_5")
+
+```
+
+
+
+```{r}
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel, respectively
+for (i in 1:m){
+  imp_list_all[[i]] <- get_bio_prob(imp_list_all[[i]], panel = panel_all)
+}
+
+#Now look at the raw scores by patients group and outcome
+summarise_pred_bio(imp_list_all)
+```
+
+
+
+```{r}
+# Check for interaction effects between
+# Patient group (aka Marshall score)
+# and predictions made by biomarkers, crash and impact
+
+all_coef <- check_for_interactions(my_imp_list = imp_list_all, mygroup = "Group2")
+
+pooled_coef_bio    <- 
+  pool_my_coefs(all_coef[["bio"]], imp_list_all) %>% 
+  format_pooled_coefs("Biomarker panel")
+
+pooled_coef_crash  <- 
+  pool_my_coefs(all_coef[["crash"]], imp_list_all) %>% 
+  format_pooled_coefs("CRASH-CT")
+
+pooled_coef_impact <- 
+  pool_my_coefs(all_coef[["impact"]], imp_list_all) %>% 
+  format_pooled_coefs("IMPACT-CT")
+
+
+pooled_coef_all <- bind_rows(pooled_coef_crash,
+                             pooled_coef_impact,
+                             pooled_coef_bio)
+
+#save results
+ft_coef <- 
+  pooled_coef_all %>%
+  regulartable() %>%
+  vline_left() %>%
+    vline_right() %>%
+  hline(i = c(4, 8)) %>%
+  merge_v(j = 1) %>%
+  fix_border_issues(part = "all") %>%
+  bg(i = c(4, 8, 12), bg = "gray90") %>%
+  bold(part = "header") %>%
+  align(j = 6, align = "right")
+  
+  
+ft_coef
+save_as_docx(ft_coef, path = "Figures/interaction.docx")
+```
+
+
+
+```{r}
+##################Marshall 1&2 cohort##################
+mytitle <- "Marshall1and2"
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m12 
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list           <- vector(mode = "list", length = m)
+imp_models_list     <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]] <- temp[["estimate"]]
+  se_list[[i]]       <- temp[["se"]]
+  prob_list[[i]]     <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m12   <- estimate_list
+se_list_m12         <- se_list
+prob_list_m12       <- prob_list
+imp_models_list_m12 <- imp_models_list
+
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m12 <- 
+  pool_myresults(estimate_list = estimate_list_m12, 
+                 se_list       = se_list_m12,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m12, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m12,
+                       mytitle   = mytitle)
+```
+
+
+```{r}
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m12,
+               myres     = myres_m12,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m12,
+                        imp_models_list = imp_models_list_m12,
+                        mytitle = mytitle)
+```
+
+
+```{r}
+######################Reference population Marshall 3-6################
+mytitle <- "Marshall3to6"
+
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m3456
+
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list       <- vector(mode = "list", length = m)
+imp_models_list <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]]   <- temp[["estimate"]]
+  se_list[[i]]         <- temp[["se"]]
+  prob_list[[i]]       <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m3456   <- estimate_list
+se_list_m3456         <- se_list
+prob_list_m3456       <- prob_list
+imp_models_list_m3456 <- imp_models_list
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m3456 <- 
+  pool_myresults(estimate_list = estimate_list_m3456,
+                 se_list       = se_list_m3456,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m3456, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m3456,
+                       mytitle   = mytitle)
+
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m3456,
+               myres     = myres_m3456,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m3456,
+                        imp_models_list = imp_models_list_m3456,
+                        mytitle = mytitle)
+```
+
+
+
+
+```{r}
+######################CT occult population (Marshall 1)################
+mytitle <- "Marshall1"
+
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m1
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+########################
+#
+# Extra step for Marshall 1
+# where test set often has new levels for 
+# Pupil or Motor score
+#
+#######################
+
+for (i in 1:m){
+imp_list[[i]]$Reactive_pupils <- ifelse(imp_list[[i]]$Reactive_pupils %in% c("0", "1"), "<2", 
+                                        as.character(imp_list[[i]]$Reactive_pupils)) 
+imp_list[[i]]$Reactive_pupils <- factor(imp_list[[i]]$Reactive_pupils)
+
+imp_list[[i]]$Motor_score <- ifelse(imp_list[[i]]$Motor_score %in% c("2", "3", "4"), "2to4",
+                                    as.character(imp_list[[i]]$Motor_score))
+imp_list[[i]]$Motor_score <- factor(imp_list[[i]]$Motor_score)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list       <- vector(mode = "list", length = m)
+imp_models_list <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]]   <- temp[["estimate"]]
+  se_list[[i]]         <- temp[["se"]]
+  prob_list[[i]]       <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m1   <- estimate_list
+se_list_m1         <- se_list
+prob_list_m1       <- prob_list
+imp_models_list_m1 <- imp_models_list
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m1 <- 
+  pool_myresults(estimate_list = estimate_list_m1,
+                 se_list       = se_list_m1,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m1, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m1,
+                       mytitle   = mytitle)
+
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m1,
+               myres     = myres_m1,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m1,
+                        imp_models_list = imp_models_list_m1,
+                        mytitle = mytitle)
+```
+```{r}
+######################Reference population (Marshall 2)################
+mytitle <- "Marshall2"
+
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m2
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list       <- vector(mode = "list", length = m)
+imp_models_list <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]]   <- temp[["estimate"]]
+  se_list[[i]]         <- temp[["se"]]
+  prob_list[[i]]       <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m2   <- estimate_list
+se_list_m2         <- se_list
+prob_list_m2       <- prob_list
+imp_models_list_m2 <- imp_models_list
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m2 <- 
+  pool_myresults(estimate_list = estimate_list_m2,
+                 se_list       = se_list_m2,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m2, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m2,
+                       mytitle   = mytitle)
+
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m2,
+               myres     = myres_m2,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m2,
+                        imp_models_list = imp_models_list_m2,
+                        mytitle = mytitle)
+```
+
+
+```{r}
+######################Reference population Marshall 3 & 4################
+mytitle <- "Marshall34" 
+
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m34
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+########################
+#
+# Extra step for Marshall 1
+# where test set often has new levels for 
+# Motor score
+#
+#######################
+
+for (i in 1:m){
+
+imp_list[[i]]$Motor_score <- ifelse(imp_list[[i]]$Motor_score %in% c("2", "3"), "2to3",
+                                    as.character(imp_list[[i]]$Motor_score))
+imp_list[[i]]$Motor_score <- factor(imp_list[[i]]$Motor_score)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list       <- vector(mode = "list", length = m)
+imp_models_list <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]]   <- temp[["estimate"]]
+  se_list[[i]]         <- temp[["se"]]
+  prob_list[[i]]       <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m34   <- estimate_list
+se_list_m34         <- se_list
+prob_list_m34       <- prob_list
+imp_models_list_m34 <- imp_models_list
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m34 <- 
+  pool_myresults(estimate_list = estimate_list_m34,
+                 se_list       = se_list_m34,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m34, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m34,
+                       mytitle   = mytitle)
+
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m34,
+               myres     = myres_m34,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m34,
+                        imp_models_list = imp_models_list_m34,
+                        mytitle = mytitle)
+
+```
+
+
+```{r}
+######################Reference population Marshall 5 & 6################
+mytitle <- "Marshall56" 
+
+
+#############################################
+#
+# STEP 1: MULTIPLE IMPUTATION
+#
+#############################################
+
+imp_list <- imp_list_m56
+
+##########################################################
+#
+# STEP 2. OBTAIN PERFORMANCE METRICS AND CORRECT THEM
+#         FOR OPTIMISM
+#
+##########################################################
+
+#get logit(probability) of poor unfavourable outcome within each imputed dataset
+#as per biomarker panel
+for (i in 1:m){
+  imp_list[[i]] <- get_bio_prob(imp_list[[i]], panel = panel_all)
+}
+
+#For each imputed dataset get optimism-corrected performance parameters
+estimate_list <- vector(mode = "list", length = m)
+se_list       <- vector(mode = "list", length = m)
+
+#Predicted probabilities of outcome for one of 1000 bootstrap models 
+# on the imputed set it was derived on
+# for plotting purposes
+prob_list       <- vector(mode = "list", length = m)
+imp_models_list <- vector(mode = "list", length = m)
+
+for (i in 1:m){
+  temp               <- results_for_one_imp(imp_list[[i]], 
+                                            mymodels, 
+                                            B)
+  estimate_list[[i]]   <- temp[["estimate"]]
+  se_list[[i]]         <- temp[["se"]]
+  prob_list[[i]]       <- temp[["prob"]]
+  imp_models_list[[i]] <- temp[["imp_models"]]
+}
+
+#Save outputs in case tweaking of graphs required
+estimate_list_m56   <- estimate_list
+se_list_m56         <- se_list
+prob_list_m56       <- prob_list
+imp_models_list_m56 <- imp_models_list
+
+#####################################################################
+#
+# STEP 3: COMBINE PERFORMANCE MEASURES ACROSS IMPUTED DATASETS
+#         USING RUBIN'S RULES
+#         AND SAVE COMBINED RESULTS TO WORD DOC
+#
+#####################################################################
+
+#Use Rubin's rules to pool results across m imputed datasets
+myres_m56 <- 
+  pool_myresults(estimate_list = estimate_list_m56,
+                 se_list       = se_list_m56,
+                 mymodels      = mymodels,
+                 m             = m)
+
+#save results as pretty table
+save_result_as_pretty_table(myres      = myres_m56, 
+                            mytitle    = mytitle)
+
+#create and save calibration plots
+make_calibration_plots(prob_list = prob_list_m56,
+                       mytitle   = mytitle)
+
+#create and save calibration plots
+make_roc_plots(prob_list = prob_list_m56,
+               myres     = myres_m56,
+               mytitle   = mytitle)
+
+#pool and save model coefficients
+save_model_coefficients(imp_list = imp_list_m56,
+                        imp_models_list = imp_models_list_m56,
+                        mytitle = mytitle)
+```
+
+
+```{r}
+#############################################
+#
+# Compare incremental value of biomarkers 
+# across different patient groups
+# i.e. Marshall scores
+#
+#############################################
+
+#main analysis: Marshall 1/2 vs >2
+m3456 <- compare_increments(suffix_A = "m12", suffix_B = "m3456")
+write.csv(m3456, "Figures/increments_m3456.csv")
+
+#plot results
+
+df_auc2 <- table_for_increment_plot2(m3456 = m3456,
+                                     metric = "auc")
+df_nag2 <- table_for_increment_plot2(m3456 = m3456,
+                                     metric = "nag")
+
+plot_auc <- 
+  plot_increments(df = df_auc2, 
+                  metric = "auc", 
+                  mywidth = 0.5, 
+                  ul = 0.6, 
+                  ll = -0.05, 
+                  ypos = 0.55,
+                  label = "full")
+
+plot_nag <- 
+  plot_increments(df = df_nag2, 
+                  metric = "nag", 
+                  mywidth = 0.5, 
+                  ul = 20, 
+                  ll = -2, 
+                  ypos = 18,
+                  label = "full")
+
+legend      <- get_legend(plot_auc)
+
+plot_auc    <- plot_auc + theme(legend.position="none")
+plot_nag    <- plot_nag + theme(legend.position="none")
+
+myplot <- 
+  grid.arrange(
+  plot_auc, 
+  plot_nag, 
+  legend,
+  ncol = 1,  
+  layout_matrix = rbind(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+                        2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                        3))
+
+ggsave(plot = myplot, 
+       filename = "Figures/Increment_plot2.tiff",
+       width = 15, height = 20, dpi = 300,
+       units = "cm")
+
+```
+```{r}
+
+#Sensitivity analyses
+m2 <- compare_increments(suffix_A = "m1", suffix_B = "m2")
+m34 <- compare_increments(suffix_A = "m2", suffix_B = "m34")
+m56 <- compare_increments(suffix_A = "m34", suffix_B = "m56")
+write.csv(m2, "Figures/increments_m2.csv")
+write.csv(m34, "Figures/increments_m34.csv")
+write.csv(m56, "Figures/increments_m56.csv")
+
+df_nag4 <- table_for_increment_plot4(m2 = m2,
+                                   m34 = m34,
+                                   m56 = m56,
+                                   metric = "nag")
+
+plot_nag <- 
+  plot_increments(df = df_nag4, 
+                metric = "nag", 
+                mywidth = 0.5, 
+                ll = -150, 
+                ul = 150, 
+                ypos = 85,
+                label = "short")
+
+df_auc4 <- table_for_increment_plot4(m2 = m2,
+                                   m34 = m34,
+                                   m56 = m56,
+                                   metric = "auc")
+
+plot_auc <- 
+  plot_increments(df = df_auc4, 
+                metric = "auc", 
+                mywidth = 0.5, 
+                ll = -10, 
+                ul = 10, 
+                ypos = 2.2,
+                label = "short")
+
+legend      <- get_legend(plot_auc)
+
+plot_auc    <- plot_auc + theme(legend.position="none")
+plot_nag    <- plot_nag + theme(legend.position="none")
+
+myplot <- 
+  grid.arrange(
+  plot_auc, 
+  plot_nag, 
+  legend,
+  ncol = 1,  
+  layout_matrix = rbind(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 
+                        2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                        3))
+
+ggsave(plot = myplot, 
+       filename = "Figures/Increment_plot4.tiff",
+       width = 15, height = 20, dpi = 300,
+       units = "cm")
+
+```
+
+
+```{r}
+write.csv(df_nag2, "Figures/delta_nag2.csv")
+write.csv(df_auc2, "Figures/delta_auc2.csv")
+write.csv(df_nag4, "Figures/delta_nag4.csv")
+write.csv(df_auc4, "Figures/delta_auc4.csv")
+```
+
+
+
+
+
